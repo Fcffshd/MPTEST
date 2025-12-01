@@ -1,0 +1,31 @@
+import RPi.GPIO as GPIO
+//Perplexity Generated code test 1, 1/12/2025
+
+import RPi.GPIO as GPIO
+import time
+
+EN_PIN = 18      # GPIO18 -> L293D pin 1 (EN1/2)
+IN1_PIN = 23     # GPIO23 -> L293D pin 2
+IN2_PIN = 24     # GPIO24 -> L293D pin 7
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(EN_PIN, GPIO.OUT)
+GPIO.setup(IN1_PIN, GPIO.OUT)
+GPIO.setup(IN2_PIN, GPIO.OUT)
+
+# Set a direction: IN1 high, IN2 low
+GPIO.output(IN1_PIN, GPIO.HIGH)
+GPIO.output(IN2_PIN, GPIO.LOW)
+
+# Create PWM on EN_PIN at 1 kHz
+pwm = GPIO.PWM(EN_PIN, 1000)   # 1000 Hz
+pwm.start(65)                  # 65% duty cycle
+
+try:
+    while True:
+        time.sleep(1)          # motor runs continuously
+except KeyboardInterrupt:
+    pass
+
+pwm.stop()
+GPIO.cleanup()

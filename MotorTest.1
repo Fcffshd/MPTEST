@@ -1,39 +1,52 @@
+#attempt2
 import RPi.GPIO as GPIO
 import time
 
-AIN1 = 17   # BCM numbering
+AIN1 = 17   # BCM numbers
 AIN2 = 27
 
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(AIN1, GPIO.OUT)
 GPIO.setup(AIN2, GPIO.OUT)
 
-# Optional: PWM for speed control
-pwm1 = GPIO.PWM(AIN1, 1000)  # 1 kHz
-pwm2 = GPIO.PWM(AIN2, 1000)
+# 20 kHz PWM (high enough to reduce audible whine)
+PWM_FREQ = 20000
+
+pwm1 = GPIO.PWM(AIN1, PWM_FREQ)
+pwm2 = GPIO.PWM(AIN2, PWM_FREQ)
 pwm1.start(0)
 pwm2.start(0)
 
-def forward(speed=100):
-    pwm1.ChangeDutyCycle(speed)  # AIN1 = PWM
-    pwm2.ChangeDutyCycle(0)      # AIN2 = 0
+def forward(speed=60):
+    # Kickstart at full power to overcome static friction
+    pwm1.ChangeDutyCycle(100)   # AIN1 = 100%
+    pwm2.ChangeDutyCycle(0)     # AIN2 = 0%
+    time.sleep(0.3)             # 300 ms burst
 
-def reverse(speed=100):
+    # Then run at requested speed
+    pwm1.ChangeDutyCycle(speed)
+    pwm2.ChangeDutyCycle(0)
+
+def reverse(speed=60):
     pwm1.ChangeDutyCycle(0)
+    pwm2.ChangeDutyCycle(100)
+    time.sleep(0.3)
     pwm2.ChangeDutyCycle(speed)
 
 def brake():
+    # Actively brake: both high
     pwm1.ChangeDutyCycle(100)
     pwm2.ChangeDutyCycle(100)
 
 def coast():
+    # Let motor spin freely: both low
     pwm1.ChangeDutyCycle(0)
     pwm2.ChangeDutyCycle(0)
 
 try:
-    forward(60)
+    forward(70)   # test
     time.sleep(2)
-    reverse(60)
+    reverse(70)
     time.sleep(2)
     brake()
 finally:

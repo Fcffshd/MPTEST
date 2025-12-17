@@ -1,0 +1,53 @@
+import RPi.GPIO as GPIO
+import time
+import subprocess
+import os
+
+# Pin definitions (BCM)
+SWITCH_PIN = 27   # 3‑prong switch COM
+BUTTON_PIN = 22   # push button
+
+VIDEO_FILE = "sams song.mp4"   # put this in the same directory as this script
+
+GPIO.setmode(GPIO.BCM)
+
+GPIO.setup(SWITCH_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)  # Switch
+GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)    # Button
+
+def play_video():
+    if not os.path.exists(VIDEO_FILE):
+        print(f"\nFile not found: {VIDEO_FILE}")
+        return
+    # -autoexit closes when finished; -nodisp if you only want audio
+    subprocess.Popen(
+        ["ffplay", "-autoexit", VIDEO_FILE],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+
+try:
+    print("Switch/Button → play MP4. Ctrl+C to exit.")
+    last_pressed = False
+
+    while True:
+        switch_on = GPIO.input(SWITCH_PIN)           # 1 when switch ON
+        button_pressed = not GPIO.input(BUTTON_PIN)  # 0 when pressed
+
+        print(
+            f"Switch: {'ON' if switch_on else 'OFF'}, "
+            f"Button: {'PRESSED' if button_pressed else 'RELEASED'}",
+            end="\r"
+        )
+
+        # Trigger on rising edge of button while switch is ON
+        if switch_on and button_pressed and not last_pressed:
+            print("\nPlaying video...")
+            play_video()
+
+        last_pressed = button_pressed
+        time.sleep(0.02)
+
+except KeyboardInterrupt:
+    pass
+finally:
+    GPIO.cleanup()

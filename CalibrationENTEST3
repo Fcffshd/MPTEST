@@ -1,0 +1,93 @@
+import RPi.GPIO as GPIO
+import time
+
+# Pin definitions (BCM)
+SWITCH_PIN = 27   # 3‑prong switch COM
+BUTTON_PIN = 22   # push button
+BUZZER_PIN = 26   # passive buzzer +
+
+GPIO.setmode(GPIO.BCM)
+
+GPIO.setup(SWITCH_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)  # Switch
+GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)    # Button
+GPIO.setup(BUZZER_PIN, GPIO.OUT)                             # Buzzer
+
+buzzer = GPIO.PWM(BUZZER_PIN, 440)  # will change per note
+buzzer.stop()
+
+# Frequencies for notes you use (Hz)
+NOTE_F3  = 175
+NOTE_C3  = 131
+NOTE_G3  = 196
+NOTE_E3  = 165
+NOTE_D3  = 147
+NOTE_G2  = 98
+NOTE_B2  = 123
+NOTE_A2  = 110
+NOTE_Ab3 = 208  # approx (G#3)
+
+# Arduino-style melody and durations
+melody = [
+    NOTE_F3, NOTE_C3, NOTE_F3, NOTE_C3, NOTE_F3, NOTE_C3, NOTE_F3, NOTE_C3,
+    NOTE_F3, NOTE_C3, NOTE_F3, NOTE_C3, NOTE_F3, NOTE_C3, NOTE_F3, NOTE_C3,
+    NOTE_G3, NOTE_C3, NOTE_F3, NOTE_E3, NOTE_D3, NOTE_G2, NOTE_C3, NOTE_B2,
+    NOTE_D3, NOTE_B2, NOTE_G2, NOTE_A2, NOTE_D3, NOTE_F3, NOTE_A3 := 220,
+    NOTE_A3, NOTE_E3, NOTE_Ab3, NOTE_E3,
+    NOTE_A3, NOTE_E3, NOTE_A3, NOTE_E3, NOTE_B2
+]
+
+noteDurations = [
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4
+]
+
+def play_note(freq, duration_s):
+    if freq <= 0:
+        buzzer.stop()
+        time.sleep(duration_s)
+        return
+    buzzer.ChangeFrequency(freq)
+    buzzer.start(50)
+    time.sleep(duration_s * 0.9)
+    buzzer.stop()
+    time.sleep(duration_s * 0.1)
+
+def play_melody():
+    for i, freq in enumerate(melody):
+        note_type = noteDurations[i]        # e.g. 4 = quarter note
+        base_ms = 1000.0 / note_type        # Arduino logic
+        duration_s = base_ms / 1000.0
+        play_note(freq, duration_s)
+
+def short_beep(duration=0.1, freq=2000):
+    buzzer.ChangeFrequency(freq)
+    buzzer.start(50)
+    time.sleep(duration)
+    buzzer.stop()
+
+try:
+    print("Switch/Button/Buzzer test with melody. Ctrl+C to exit.")
+    while True:
+        switch_on = GPIO.input(SWITCH_PIN)           # 1 when switch ON
+        button_pressed = not GPIO.input(BUTTON_PIN)  # 0 when pressed
+
+        print(
+            f"Switch: {'ON' if switch_on else 'OFF'}, "
+            f"Button: {'PRESSED' if button_pressed else 'RELEASED'}",
+            end="\r"
+        )
+
+        if switch_on and button_pressed:
+            short_beep(0.1, 2500)
+            play_melody()
+            time.sleep(0.3)
+
+        time.sleep(0.02)
+
+except KeyboardInterrupt:
+    pass
+finally:
+    buzzer.stop()
+    GPIO.cleanup()

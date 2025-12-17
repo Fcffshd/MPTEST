@@ -1,0 +1,87 @@
+import RPi.GPIO as GPIO
+import time
+
+# Pin definitions (BCM)
+SWITCH_PIN = 27   # 3‑prong switch COM
+BUTTON_PIN = 22   # push button
+BUZZER_PIN = 26   # passive buzzer +
+
+GPIO.setmode(GPIO.BCM)
+
+GPIO.setup(SWITCH_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)  # Switch
+GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)    # Button
+GPIO.setup(BUZZER_PIN, GPIO.OUT)                            # Buzzer
+
+buzzer = GPIO.PWM(BUZZER_PIN, 440)  # freq will be changed per note
+buzzer.stop()
+
+# Note frequencies (Hz)
+NOTES = {
+    "C4": 262,
+    "D4": 294,
+    "E4": 330,
+    "F4": 349,
+    "G4": 392,
+    "A4": 440,
+    "B4": 494,
+    "C5": 523,
+    "REST": 0,
+}
+
+# Short FNaF‑style march‑like pattern (original, not the real Theodore March)
+MELODY = [
+    ("C4", 0.25), ("E4", 0.25), ("G4", 0.25), ("C5", 0.25),
+    ("REST", 0.10),
+    ("C5", 0.25), ("G4", 0.25), ("E4", 0.25), ("C4", 0.25),
+    ("REST", 0.10),
+    ("G4", 0.25), ("E4", 0.25), ("C4", 0.25), ("G4", 0.25),
+    ("REST", 0.10),
+    ("E4", 0.25), ("G4", 0.25), ("C5", 0.5),
+]
+
+def play_note(freq, duration):
+    if freq == 0:
+        buzzer.stop()
+        time.sleep(duration)
+        return
+    buzzer.ChangeFrequency(freq)
+    buzzer.start(50)           # 50% duty
+    time.sleep(duration * 0.9)
+    buzzer.stop()
+    time.sleep(duration * 0.1)
+
+def play_march():
+    for name, dur in MELODY:
+        play_note(NOTES[name], dur)
+
+def short_beep(duration=0.1, freq=2000):
+    buzzer.ChangeFrequency(freq)
+    buzzer.start(50)
+    time.sleep(duration)
+    buzzer.stop()
+
+try:
+    print("Switch/Button/Buzzer test with march. Ctrl+C to exit.")
+    while True:
+        switch_on = GPIO.input(SWITCH_PIN)           # 1 when switch ON
+        button_pressed = not GPIO.input(BUTTON_PIN)  # 0 when pressed
+
+        print(
+            f"Switch: {'ON' if switch_on else 'OFF'}, "
+            f"Button: {'PRESSED' if button_pressed else 'RELEASED'}",
+            end="\r"
+        )
+
+        if switch_on and button_pressed:
+            # Calibration trigger
+            short_beep(0.1, 2500)   # quick confirmation beep
+            play_march()            # play the short march
+            time.sleep(0.3)         # debounce after calibration
+
+        time.sleep(0.02)
+
+except KeyboardInterrupt:
+    pass
+finally:
+    buzzer.stop()
+    GPIO.cleanup()

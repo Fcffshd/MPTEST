@@ -1,5 +1,4 @@
 #version 1.3
-
 import serial
 import time
 import threading
@@ -117,4 +116,42 @@ try:
                 # START CALIBRATION
                 calibrating = True
                 calib_complete = False
-                calibration_start_time = time.
+                calibration_start_time = time.time()
+                emg_data.clear()
+                no_flex_start = calibration_start_time
+                play_calib_start()
+                print("\n🚀 *** CALIBRATION STARTED ***")
+                print("   0-5s: RELAX (NO_FLEX)")
+                
+            elif calib_complete:
+                print("\n🔄 Press again to restart calibration")
+        
+        button_last_state = button_state
+        
+        if calibrating:
+            elapsed = time.time() - calibration_start_time
+            
+            if elapsed < 5:
+                pass  # NO_FLEX
+            elif elapsed < 15:
+                if elapsed - 5 < 0.1:
+                    print("\n   5-15s: MEDIUM FLEX")
+            else:
+                if elapsed - 15 < 0.1:
+                    print("\n   15-20s: FULL FLEX (MAX EFFORT!)")
+            
+            if elapsed >= 20.0:
+                calibrating = False
+                calib_complete = True
+                play_calib_complete()
+                process_calibration_ranges()
+        
+        time.sleep(0.02)
+
+except KeyboardInterrupt:
+    pass
+finally:
+    buzzer.stop()
+    GPIO.cleanup()
+    ser.close()
+    print("\n👋 Exit complete.")

@@ -1,4 +1,4 @@
-#version 1.2 - FIXED function order
+#version 1.2 - FIXED function order + POWER TEST
 import RPi.GPIO as GPIO
 import time
 import serial
@@ -37,9 +37,20 @@ def angle_to_duty(angle):
     pulse_us = 575 + (2460-575) * (angle / 180)
     return round((pulse_us / 20000) * 100, 2)
 
-def servo_set_angle(angle):  # ✅ DEFINED BEFORE USE
+def servo_set_angle(angle):
     duty = angle_to_duty(angle)
     servo.ChangeDutyCycle(duty)
+
+# =========================
+# 🔋 POWER TEST - INSERTED HERE
+# =========================
+print("🔋 Power test - external 6V required!")
+for duty in [2.5, 7.5, 12.5]:  # 0°, 90°, 180°
+    print(f"Testing {duty}% duty...")
+    servo.ChangeDutyCycle(duty)
+    time.sleep(3)
+servo.ChangeDutyCycle(0)
+print("Power test complete!")
 
 # =========================
 # HS-311 STARTUP TEST 

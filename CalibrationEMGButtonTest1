@@ -1,0 +1,176 @@
+import serial
+import time
+import threading
+import RPi.GPIO as GPIO
+
+# =========================
+# Pins
+# =========================
+BUTTON_PIN = 22   # push button
+BUZZER_PIN = 26   # passive buzzer +
+
+# =========================
+# Globals
+# =========================
+calibrating = False
+calibration_start_time = 0
+emg_data = []  # stores all EMG values with timestamps during calibration
+no_flex_start = 0
+medium_flex_start = 0
+full_flex_start = 0
+calib_complete = False
+
+# Calibration ranges (will be set after calibration)
+NO_FLEX_MIN = 0
+NO_FLEX_MAX = 0
+MEDIUM_FLEX_MIN = 0
+MEDIUM_FLEX_MAX = 0
+FULL_FLEX_MIN = 0
+FULL_FLEX_MAX = 0
+
+# UART setup
+ser = serial.Serial('/dev/ttyAMA0', 115200)
+
+# GPIO setup
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)    # Button active low
+GPIO.setup(BUZZER_PIN, GPIO.OUT)
+buzzer = GPIO.PWM(BUZZER_PIN, 2000)
+buzzer.stop()
+
+def short_beep(duration=0.2, freq=2000):
+    """Short confirmation beep"""
+    buzzer.ChangeFrequency(freq)
+    buzzer.start(50)
+    time.sleep(duration)
+    buzzer.stop()
+
+def play_calib_start():
+    """Beep sequence for calibration start"""
+    for _ in range(3):
+        short_beep(0.1, 1500)
+        time.sleep(0.1)
+    time.sleep(0.2)
+
+def play_calib_complete():
+    """Long success beep"""
+    buzzer.ChangeFrequency(1000)
+    buzzer.start(50)
+    time.sleep(1.0)
+    buzzer.stop()
+
+def uart_reader():
+    """Background thread to read EMG data continuously"""
+    global emg_data, calibrating, calib_complete
+    while True:
+        try:
+            line = ser.readline().decode().strip()
+            if line:
+                emg_value = float(line)
+                current_time = time.time()
+                
+                if calibrating:
+                    emg_data.append((current_time, emg_value))
+                
+                print(f"EMG: {emg_value:.2f}", end='\r')
+                
+        except Exception as e:
+            pass  # Ignore decode/serial errors
+
+# Start EMG reader thread
+uart_thread = threading.Thread(target=uart_reader, daemon=True)
+uart_thread.start()
+
+try:
+    print("Calibration system ready. Press button to start 20s calibration.")
+    print("Phases: 0-5s NO_FLEX, 5-15s MEDIUM_FLEX, 15-20s FULL_FLEX")
+    
+    button_last_state = 1  # not pressed
+    
+    while True:
+        button_state = GPIO.input(BUTTON_PIN)  # 0 = pressed
+        
+        # Button press edge detection
+        if button_last_state == 1 and button_state == 0:
+            if not calibrating and not calib_complete:
+                # Start calibration
+                calibrating = True
+                calib_complete = False
+                calibration_start_time = time.time()
+                emg_data = []  # Clear previous data
+                no_flex_start = calibration_start_time
+                play_calib_start()
+                print("\n*** CALIBRATION STARTED ***")
+                print("First 5s: NO_FLEX (relaxed)")
+                
+            elif calib_complete:
+                # Reset for new calibration
+                calibrating = False
+                calib_complete = False
+                print("\nPress again to restart calibration.")
+        
+        button_last_state = button_state
+        
+        # Handle calibration phases
+        if calibrating:
+            elapsed = time.time() - calibration_start_time
+            
+            if elapsed < 5.0:
+                # Phase 1: NO_FLEX (0-5s)
+                pass
+            elif elapsed < 15.0:
+                # Phase 2: MEDIUM_FLEX (5-15s)
+                if elapsed - 5.0 < 0.1:  # Just entered phase
+                    print("\nNext 10s: MEDIUM_FLEX")
+            else:
+                # Phase 3: FULL_FLEX (15-20s)
+                if elapsed - 15.0 < 0.1:  # Just entered phase
+                    print("\nLast 5s: FULL_FLEX (max effort!)")
+            
+            if elapsed >= 20.0:
+                # Calibration complete
+                calibrating = False
+                calib_complete = True
+                play_calib_complete()
+                process_calibration_ranges()
+        
+        time.sleep(0.02)
+
+except KeyboardInterrupt:
+    pass
+
+finally:
+    buzzer.stop()
+    GPIO.cleanup()
+    ser.close()
+    print("\nExit.")
+
+def process_calibration_ranges():
+    """Calculate min/max for each phase and print thresholds"""
+    global NO_FLEX_MIN, NO_FLEX_MAX, MEDIUM_FLEX_MIN, MEDIUM_FLEX_MAX, FULL_FLEX_MIN, FULL_FLEX_MAX
+    
+    no_flex_data = [val for ts, val in emg_data if no_flex_start <= ts < no_flex_start + 5]
+    medium_data = [val for ts, val in emg_data if no_flex_start + 5 <= ts < no_flex_start + 15]
+    full_data = [val for ts, val in emg_data if no_flex_start + 15 <= ts < no_flex_start + 20]
+    
+    if no_flex_data:
+        NO_FLEX_MIN = min(no_flex_data)
+        NO_FLEX_MAX = max(no_flex_data)
+    if medium_data:
+        MEDIUM_FLEX_MIN = min(medium_data)
+        MEDIUM_FLEX_MAX = max(medium_data)
+    if full_data:
+        FULL_FLEX_MIN = min(full_data)
+        FULL_FLEX_MAX = max(full_data)
+    
+    print("\n" + "="*50)
+    print("CALIBRATION COMPLETE - THRESHOLDS ESTABLISHED")
+    print("="*50)
+    print(f"NO_FLEX range:     {NO_FLEX_MIN:.2f} to {NO_FLEX_MAX:.2f}")
+    print(f"MEDIUM_FLEX range: {MEDIUM_FLEX_MIN:.2f} to {MEDIUM_FLEX_MAX:.2f}")
+    print(f"FULL_FLEX range:   {FULL_FLEX_MIN:.2f} to {FULL_FLEX_MAX:.2f}")
+    print("\nUse these globals for EMG classification:")
+    print("- if emg < NO_FLEX_MAX: NO_FLEX")
+    print("- elif emg < MEDIUM_FLEX_MAX: MEDIUM_FLEX") 
+    print("- else: FULL_FLEX")
+    print("="*50 + "\n")

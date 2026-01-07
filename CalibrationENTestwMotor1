@@ -97,13 +97,13 @@ def short_beep(duration=0.1, freq=2000):
 # =========================
 def angle_to_duty(angle):
     """
-    Map angle (0–270 deg) to duty cycle for 50 Hz PWM.
+    Map angle (0–180 deg) to duty cycle for 50 Hz PWM.
     Adjust min_duty and max_duty to match your servo.
     """
     min_duty = 2.5   # approx pulse for 0°
-    max_duty = 12.5  # approx pulse for 270°
-    angle = max(0, min(270, angle))
-    duty = min_duty + (max_duty - min_duty) * (angle / 270.0)
+    max_duty = 10.0  # approx pulse for 180°
+    angle = max(0, min(180, angle))
+    duty = min_duty + (max_duty - min_duty) * (angle / 180.0)
     return duty
 
 def servo_set_angle(angle):
@@ -129,7 +129,7 @@ def uart_reader():
 # =========================
 def servo_oscillator():
     """
-    Oscillate servo between 0° and 270° while switch is ON.
+    Oscillate servo between 0° and 180° while switch is ON.
     Basic blocking scan in this thread.
     """
     global running
@@ -150,8 +150,8 @@ def servo_oscillator():
 
             angle += direction * step
 
-            if angle >= 270:
-                angle = 270
+            if angle >= 180:
+                angle = 180
                 direction = -1
             elif angle <= 0:
                 angle = 0

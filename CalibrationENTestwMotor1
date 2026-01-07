@@ -93,15 +93,15 @@ def short_beep(duration=0.1, freq=2000):
     buzzer.stop()
 
 # =========================
-# Servo helper
+# Servo helper - CHANGED TO 180°
 # =========================
 def angle_to_duty(angle):
     """
     Map angle (0–180 deg) to duty cycle for 50 Hz PWM.
-    Adjust min_duty and max_duty to match your servo.
+    Standard servo timing: 2.5% duty (0°) to 10% duty (180°).
     """
-    min_duty = 2.5   # approx pulse for 0°
-    max_duty = 10.0  # approx pulse for 180°
+    min_duty = 2.5   # 0.5ms pulse / 20ms period = 2.5%
+    max_duty = 10.0  # 2.0ms pulse / 20ms period = 10%
     angle = max(0, min(180, angle))
     duty = min_duty + (max_duty - min_duty) * (angle / 180.0)
     return duty
@@ -121,43 +121,37 @@ def uart_reader():
             if line:
                 print("Received EMG:", line)
         except Exception:
-            # Ignore decode/serial errors but continue loop
             pass
 
 # =========================
-# Thread: Servo oscillation
+# Thread: Servo oscillation - CHANGED TO 180°
 # =========================
 def servo_oscillator():
     """
     Oscillate servo between 0° and 180° while switch is ON.
-    Basic blocking scan in this thread.
     """
     global running
-    direction = 1  # 1 = increasing angle, -1 = decreasing
+    direction = 1
     angle = 0
-
-    # Step size and delay control speed
-    step = 10      # degrees per step
-    delay = 0.05   # seconds per step
+    step = 10
+    delay = 0.05
 
     while running:
-        switch_on = GPIO.input(SWITCH_PIN)  # 1 when switch ON
+        switch_on = GPIO.input(SWITCH_PIN)
 
         if switch_on:
-            # Move servo
             servo_set_angle(angle)
             time.sleep(delay)
 
             angle += direction * step
 
-            if angle >= 180:
+            if angle >= 180:  # CHANGED: 180° limit
                 angle = 180
                 direction = -1
             elif angle <= 0:
                 angle = 0
                 direction = 1
         else:
-            # If switch OFF, you may choose to park at 0°
             servo_set_angle(0)
             time.sleep(0.1)
 
@@ -165,9 +159,8 @@ def servo_oscillator():
 # Main
 # =========================
 try:
-    print("System start: Switch/Button/Buzzer/Servo/EMG. Ctrl+C to exit.")
+    print("System start: Switch/Button/Buzzer/Servo(0-180°)/EMG. Ctrl+C to exit.")
 
-    # Start background threads
     uart_thread = threading.Thread(target=uart_reader, daemon=True)
     servo_thread = threading.Thread(target=servo_oscillator, daemon=True)
     uart_thread.start()
@@ -176,22 +169,18 @@ try:
     last_button_state = GPIO.input(BUTTON_PIN)
 
     while True:
-        switch_on = GPIO.input(SWITCH_PIN)           # 1 when switch ON
-        button_state = GPIO.input(BUTTON_PIN)        # 1 = not pressed (PUD_UP), 0 = pressed
+        switch_on = GPIO.input(SWITCH_PIN)
+        button_state = GPIO.input(BUTTON_PIN)
         button_pressed = (button_state == 0)
 
-        # Simple edge detection for button press
         if last_button_state == 1 and button_state == 0:
-            # Button just pressed
             Calibration_Flag = True
             print("\nCalibration button pressed -> Calibration_Flag = True")
-            # Play beep + melody immediately on press
             short_beep(0.1, 2500)
             play_melody()
 
         last_button_state = button_state
 
-        # Status print (overwrites same line)
         print(
             f"Switch: {'ON' if switch_on else 'OFF'}, "
             f"Button: {'PRESSED' if button_pressed else 'RELEASED'}, "

@@ -14,8 +14,8 @@ MAX_EMG_V = 1.8    # Voltage for 180 degrees
 # Kp (Proportional): Higher = Faster reaction, more jitter
 # Ki (Integral):     Higher = Pushes harder to reach exact target (can cause overshoot)
 # Kd (Derivative):   Higher = Resists sudden changes (dampens the "fuzziness")
-PID_KP = 0.15      
-PID_KI = 0.01
+PID_KP = 0.20      
+PID_KI = 0.05
 PID_KD = 0.05
 
 # Pins

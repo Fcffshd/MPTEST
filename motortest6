@@ -2,44 +2,36 @@ import RPi.GPIO as GPIO
 import time
 
 SERVO_PIN = 18
+MAX_ANGLE = 270  # use 180 if you set the servo to 180° mode
 
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(SERVO_PIN, GPIO.OUT)
-
-servo = GPIO.PWM(SERVO_PIN, 50)  # 50 Hz
+servo = GPIO.PWM(SERVO_PIN, 50)  # 50Hz
 servo.start(0)
 time.sleep(1)
 
 def angle_to_duty(angle):
-    # Conservative 0–180° mapping for HS-311
-    angle = max(0, min(180, angle))
-    pulse_us = 900 + (2100 - 900) * (angle / 180.0)
-    return (pulse_us / 20000.0) * 100.0
+    angle = max(0, min(MAX_ANGLE, angle))
+    pulse_min = 500.0   # us
+    pulse_max = 2500.0  # us
+    pulse = pulse_min + (pulse_max - pulse_min) * (angle / MAX_ANGLE)
+    duty = (pulse / 20000.0) * 100.0  # 20ms frame
+    return duty
 
 def servo_set_angle(angle):
     duty = angle_to_duty(angle)
     servo.ChangeDutyCycle(duty)
-    time.sleep(0.02)  # small settle delay
+    time.sleep(0.03)
 
 try:
-    MIN_ANGLE = 0
-    MAX_ANGLE = 180  # set to 270 only if your servo genuinely supports 270°
-
-    print("Sweeping slowly from 0° to max and back... Ctrl+C to stop")
-
+    print(f"Sweeping 0° → {MAX_ANGLE}° slowly...")
     while True:
-        # Up: 0 -> MAX
-        for angle in range(MIN_ANGLE, MAX_ANGLE + 1, 2):  # step 2° for smoothness
-            print(f"\rAngle: {angle}°", end="")
-            servo_set_angle(angle)
-            time.sleep(0.03)  # speed
-
-        # Down: MAX -> 0
-        for angle in range(MAX_ANGLE, MIN_ANGLE - 1, -2):
-            print(f"\rAngle: {angle}°", end="")
-            servo_set_angle(angle)
-            time.sleep(0.03)
-
+        for a in range(0, MAX_ANGLE + 1, 3):
+            print(f"\rAngle: {a}°", end="")
+            servo_set_angle(a)
+        for a in range(MAX_ANGLE, -1, -3):
+            print(f"\rAngle: {a}°", end="")
+            servo_set_angle(a)
 except KeyboardInterrupt:
     pass
 finally:

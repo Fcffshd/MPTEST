@@ -1,0 +1,174 @@
+#version 1 - Updated calibration will then affect PID values.
+import RPi.GPIO as GPIO
+import time
+import serial
+import threading
+import numpy as np
+
+# =========================
+# Pin definitions (BCM)
+# =========================
+SWITCH_PIN = 27   # 3-prong switch COM -> EN for PID/Motor
+BUTTON_PIN = 22   # push button -> Calibration trigger
+BUZZER_PIN = 26   # passive buzzer +
+SERVO_PIN  = 18   # PWM0 output for servo (GPIO18)
+
+# =========================
+# Global state
+# =========================
+Calibration_Flag = False
+running = True
+pid_enabled = False  # PID EN state
+thresholds = {
+    'MIN_EMG_V': 0.8,
+    'MAX_EMG_V': 1.8,
+    'PID_KP': 0.20,      # Proportional gain
+    'PID_KI': 0.05,      # Integral gain  
+    'PID_KD': 0.05       # Derivative gain
+}
+
+# =========================
+# Setup GPIO
+# =========================
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(SWITCH_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)  # Switch (EN)
+GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)    # Button (calib)
+GPIO.setup(BUZZER_PIN, GPIO.OUT)                             # Buzzer
+GPIO.setup(SERVO_PIN, GPIO.OUT)                              # Servo PWM
+
+# PWM setup
+buzzer = GPIO.PWM(BUZZER_PIN, 440)
+buzzer.stop()
+servo = GPIO.PWM(SERVO_PIN, 50)
+servo.start(0)
+
+# EMG UART
+ser = serial.Serial('/dev/ttyAMA0', 115200)
+
+# =========================
+# PID Controller Class
+# =========================
+class PID:
+    def __init__(self, kp, ki, kd, min_out, max_out):
+        self.kp, self.ki, self.kd = kp, ki, kd
+        self.min_out, self.max_out = min_out, max_out
+        self.reset()
+
+    def reset(self):
+        self.prev_error = 0
+        self.integral = 0
+        self.last_time = time.time()
+
+    def update(self, setpoint, measurement):
+        current_time = time.time()
+        dt = current_time - self.last_time
+        if dt <= 0: return 0
+        
+        error = setpoint - measurement
+        self.integral += error * dt
+        
+        P = self.kp * error
+        I = self.ki * self.integral
+        D = self.kd * (error - self.prev_error) / dt
+        
+        output = P + I + D
+        
+        # Clamp output
+        output = max(self.min_out, min(self.max_out, output))
+        
+        self.prev_error = error
+        self.last_time = current_time
+        return output
+
+# Initialize PID with specified gains
+pid_controller = PID(**{k: v for k, v in thresholds.items() if k.startswith('PID_')})
+
+# =========================
+# Servo Functions (0-180°)
+# =========================
+def angle_to_duty(angle):
+    angle = max(0, min(180, angle))
+    min_duty, max_duty = 2.5, 10.0
+    return min_duty + (max_duty - min_duty) * (angle / 180.0)
+
+def servo_set_angle(angle):
+    duty = angle_to_duty(angle)
+    servo.ChangeDutyCycle(duty)
+
+# =========================
+# Thresholds to PID params mapping
+# =========================
+def apply_thresholds_to_pid():
+    """Apply calibration thresholds to PID limits"""
+    global pid_controller
+    pid_controller.min_out = thresholds['MIN_EMG_V']
+    pid_controller.max_out = thresholds['MAX_EMG_V']
+    pid_controller.kp = thresholds['PID_KP']
+    pid_controller.ki = thresholds['PID_KI']
+    pid_controller.kd = thresholds['PID_KD']
+    pid_controller.reset()
+    print(f"✅ PID updated: Kp={thresholds['PID_KP']:.2f}, Ki={thresholds['PID_KI']:.2f}, Kd={thresholds['PID_KD']:.2f}")
+    print(f"   EMG range: {thresholds['MIN_EMG_V']}V → {thresholds['MAX_EMG_V']}V")
+
+# =========================
+# Buzzer melodies (unchanged)
+# =========================
+NOTE_E5, NOTE_D5, NOTE_FS4, NOTE_GS4 = 659, 587, 370, 415
+NOTE_CS5, NOTE_B4, NOTE_D4, NOTE_E4 = 554, 494, 294, 330
+NOTE_A4, NOTE_CS4 = 440, 277
+
+melody = [NOTE_E5, NOTE_D5, NOTE_FS4, NOTE_GS4, NOTE_CS5, NOTE_B4, NOTE_D4, NOTE_E4, NOTE_B4, NOTE_A4, NOTE_CS4, NOTE_E4, NOTE_A4]
+durations = [8, 8, 4, 4, 8, 8, 4, 4, 8, 8, 4, 4, 2]
+
+def play_note(freq, duration_s):
+    if freq <= 0:
+        buzzer.stop()
+        time.sleep(duration_s)
+        return
+    buzzer.ChangeFrequency(freq)
+    buzzer.start(50)
+    time.sleep(duration_s * 0.9)
+    buzzer.stop()
+    time.sleep(duration_s * 0.1)
+
+def play_melody():
+    for i, freq in enumerate(melody):
+        duration_s = 1000.0 / durations[i] / 1000.0
+        play_note(freq, duration_s)
+
+def short_beep(duration=0.1, freq=2000):
+    buzzer.ChangeFrequency(freq)
+    buzzer.start(50)
+    time.sleep(duration)
+    buzzer.stop()
+
+# =========================
+# CALIBRATION MODE
+# =========================
+def calibration_mode():
+    global Calibration_Flag, thresholds
+    
+    print("\n🎯 CALIBRATION MODE ACTIVE (5 seconds)")
+    print("Relax muscle completely...")
+    
+    emg_samples = []
+    start_time = time.time()
+    
+    while time.time() - start_time < 5.0:
+        try:
+            if ser.in_waiting > 0:
+                line = ser.readline().decode().strip()
+                if line.startswith("EMG:"):
+                    voltage = float(line.split(":")[1].strip().split()[0])
+                    emg_samples.append(voltage)
+                    print(f"EMG: {voltage:.2f}V", end="\r")
+        except:
+            pass
+        time.sleep(0.05)
+    
+    if emg_samples:
+        min_emg = np.min(emg_samples)
+        max_emg = np.max(emg_samples)
+        
+        thresholds.update({
+            'MIN_EMG_V': max(0.5, min_emg

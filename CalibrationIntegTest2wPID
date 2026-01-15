@@ -1,5 +1,5 @@
-#15.1.26 3.15pm
-# EMG PID Servo Control v1.5 - 20s Calibration + PID
+#15.1.26 3.25pm
+# EMG PID Servo Control v1.6 - 20s Calibration w/ MEAN/MEDIAN Thresholds
 import RPi.GPIO as GPIO
 import time
 import serial
@@ -24,15 +24,12 @@ calibration_start_time = 0
 emg_data = []  # (timestamp, voltage)
 calib_complete = False
 no_flex_start = 0
+smoothed_emg = 0.8
 
 # Dynamic thresholds (set by calibration)
 thresholds = {
-    'NO_FLEX_MIN': 0.5, 'NO_FLEX_MAX': 0.8,
-    'MEDIUM_MIN': 0.8, 'MEDIUM_MAX': 1.5,
-    'FULL_MIN': 1.5, 'FULL_MAX': 2.5,
     'PID_KP': 0.20, 'PID_KI': 0.05, 'PID_KD': 0.05
 }
-smoothed_emg = 0.8
 
 # =========================
 # GPIO + PWM Setup
@@ -85,7 +82,7 @@ class PID:
         return output
 
 # =========================
-# Servo angle mapping (0-180°)
+# Servo Functions (0-180°)
 # =========================
 def angle_to_duty(angle):
     angle = max(0, min(180, angle))
@@ -96,37 +93,63 @@ def servo_set_angle(angle):
     servo.ChangeDutyCycle(duty)
 
 # =========================
-# 20s Calibration (5s relax + 10s medium + 5s full)
+# 20s Calibration w/ MEAN/MEDIAN
 # =========================
 def process_calibration():
-    """Calculate 3-phase thresholds"""
+    """Calculate MEAN/MEDIAN thresholds for each phase"""
     global thresholds, calib_complete
     
-    no_flex_data = [v for ts, v in emg_data if no_flex_start <= ts < no_flex_start + 5]
-    medium_data = [v for ts, v in emg_data if no_flex_start + 5 <= ts < no_flex_start + 15]
-    full_data = [v for ts, v in emg_data if no_flex_start + 15 <= ts < no_flex_start + 20]
+    # Extract 3 phases (5s + 10s + 5s = 20s)
+    no_flex_data = np.array([v for ts, v in emg_data if no_flex_start <= ts < no_flex_start + 5])
+    medium_data = np.array([v for ts, v in emg_data if no_flex_start + 5 <= ts < no_flex_start + 15])
+    full_data = np.array([v for ts, v in emg_data if no_flex_start + 15 <= ts < no_flex_start + 20])
     
-    if no_flex_data: 
-        thresholds['NO_FLEX_MIN'] = np.min(no_flex_data) - 0.05
-        thresholds['NO_FLEX_MAX'] = np.max(no_flex_data) + 0.05
-    if medium_data:
-        thresholds['MEDIUM_MIN'] = np.min(medium_data) - 0.05
-        thresholds['MEDIUM_MAX'] = np.max(medium_data) + 0.05
-    if full_data:
-        thresholds['FULL_MIN'] = np.min(full_data) - 0.05
-        thresholds['FULL_MAX'] = np.max(full_data) + 0.20  # Wider for max effort
+    # MEAN and MEDIAN thresholds
+    if len(no_flex_data) > 5:  # Min samples
+        thresholds['RELAX_MEAN'] = np.mean(no_flex_data)
+        thresholds['RELAX_MEDIAN'] = np.median(no_flex_data)
+        thresholds['RELAX_THRESHOLD'] = thresholds['RELAX_MEDIAN']
         
-    print("\n" + "="*70)
-    print("✅ 20s CALIBRATION COMPLETE")
-    print("="*70)
-    print(f"RELAX:     {thresholds['NO_FLEX_MIN']:5.2f}V ↔ {thresholds['NO_FLEX_MAX']:5.2f}V")
-    print(f"MEDIUM:    {thresholds['MEDIUM_MIN']:5.2f}V ↔ {thresholds['MEDIUM_MAX']:5.2f}V") 
-    print(f"FULL:      {thresholds['FULL_MIN']:5.2f}V ↔ {thresholds['FULL_MAX']:5.2f}V")
-    print("="*70)
+    if len(medium_data) > 10:
+        thresholds['MEDIUM_MEAN'] = np.mean(medium_data)
+        thresholds['MEDIUM_MEDIAN'] = np.median(medium_data)
+        thresholds['MEDIUM_THRESHOLD'] = thresholds['MEDIUM_MEDIAN']
+        
+    if len(full_data) > 5:
+        thresholds['FULL_MEAN'] = np.mean(full_data)
+        thresholds['FULL_MEDIAN'] = np.median(full_data)
+        thresholds['FULL_THRESHOLD'] = thresholds['FULL_MEDIAN']
+    
+    # PID uses calibrated range
+    thresholds['PID_MIN'] = thresholds.get('RELAX_THRESHOLD', 0.5)
+    thresholds['PID_MAX'] = thresholds.get('FULL_THRESHOLD', 2.5)
+    
+    print("\n" + "="*80)
+    print("✅ 20s CALIBRATION COMPLETE - MEAN/MEDIAN THRESHOLDS")
+    print("="*80)
+    print(f"RELAX:  MEAN={thresholds['RELAX_MEAN']:6.3f}V | MEDIAN(THRESHOLD)={thresholds['RELAX_THRESHOLD']:6.3f}V")
+    print(f"MEDIUM: MEAN={thresholds['MEDIUM_MEAN']:6.3f}V | MEDIAN(THRESHOLD)={thresholds['MEDIUM_THRESHOLD']:6.3f}V")
+    print(f"FULL:   MEAN={thresholds['FULL_MEAN']:6.3f}V | MEDIAN(THRESHOLD)={thresholds['FULL_THRESHOLD']:6.3f}V")
+    print(f"PID Range: {thresholds['PID_MIN']:5.3f}V → {thresholds['PID_MAX']:5.3f}V")
+    print("="*80)
+    
+    # Test classification
+    phase = classify_emg(smoothed_emg)
+    print(f"Current EMG {smoothed_emg:.2f}V → {phase}")
+    
     calib_complete = True
 
+def classify_emg(emg_value):
+    """Classify based on median thresholds"""
+    if emg_value < thresholds.get('MEDIUM_THRESHOLD', 1.0):
+        return "RELAX"
+    elif emg_value < thresholds.get('FULL_THRESHOLD', 2.0):
+        return "MEDIUM"
+    else:
+        return "FULL"
+
 # =========================
-# Buzzer
+# Buzzer Functions
 # =========================
 def short_beep(duration=0.1, freq=2000):
     buzzer.ChangeFrequency(freq)
@@ -145,80 +168,78 @@ def play_calib_sequence():
 # EMG UART Reader Thread
 # =========================
 def uart_reader():
-    global emg_data, calibrating
+    global emg_data, calibrating, smoothed_emg
     while running:
         try:
             if ser.in_waiting > 0:
                 line = ser.readline().decode('utf-8', errors='ignore').strip()
                 if line.startswith("EMG:"):
                     voltage = float(line.split(":")[1].split("V")[0])
-                    ts = time.time()
+                    
+                    # Global smoothing
+                    alpha = 0.1
+                    smoothed_emg = alpha * voltage + (1 - alpha) * smoothed_emg
                     
                     if calibrating:
-                        emg_data.append((ts, voltage))
+                        emg_data.append((time.time(), voltage))
                     
-                    print(f"EMG: {voltage:.2f}V", end='\r')
+                    print(f"EMG:{voltage:.2f}V S:{smoothed_emg:.2f}V", end='\r')
         except:
             pass
         time.sleep(0.01)
 
 # =========================
-# Main EMG PID Loop
+# EMG PID Control Thread
 # =========================
 def emg_pid_thread():
-    global smoothed_emg, pid_enabled
-    
-    # PID uses full range as setpoint
-    pid_controller = PID(thresholds['PID_KP'], thresholds['PID_KI'], thresholds['PID_KD'],
-                        thresholds['NO_FLEX_MIN'], thresholds['FULL_MAX'])
+    global pid_enabled
     
     while running:
         switch_state = GPIO.input(SWITCH_PIN)
         pid_enabled = switch_state
         
         if pid_enabled and calib_complete:
+            # Create PID with calibrated range
+            pid_controller = PID(thresholds['PID_KP'], thresholds['PID_KI'], thresholds['PID_KD'],
+                                thresholds['PID_MIN'], thresholds['PID_MAX'])
+            
             try:
-                # Get latest EMG (simplified for thread)
-                line = ser.readline().decode('utf-8', errors='ignore').strip()
-                if line.startswith("EMG:"):
-                    raw_emg = float(line.split(":")[1].split("V")[0])
-                    
-                    # Smooth
-                    alpha = 0.1
-                    smoothed_emg = alpha * raw_emg + (1 - alpha) * smoothed_emg
-                    
-                    # PID tracks to FULL_MAX (clench = max servo)
-                    adjustment = pid_controller.update(thresholds['FULL_MAX'], smoothed_emg)
-                    target_emg = smoothed_emg + adjustment
-                    target_emg = max(thresholds['NO_FLEX_MIN'], min(thresholds['FULL_MAX'], target_emg))
-                    
-                    # Map to servo 0-180°
-                    angle = int((target_emg - thresholds['NO_FLEX_MIN']) / 
-                               (thresholds['FULL_MAX'] - thresholds['NO_FLEX_MIN']) * 180)
-                    servo_set_angle(angle)
-                    
-                    print(f"EMG:{raw_emg:.2f}S:{smoothed_emg:.2f} PID:{adjustment:.2f}°{angle}", end='\r')
-                    
+                # PID: Track FULL_THRESHOLD for max clench = max servo
+                adjustment = pid_controller.update(thresholds['FULL_THRESHOLD'], smoothed_emg)
+                target_emg = smoothed_emg + adjustment
+                target_emg = max(thresholds['PID_MIN'], min(thresholds['PID_MAX'], target_emg))
+                
+                # Map to servo angle (0-180°)
+                angle = int((target_emg - thresholds['PID_MIN']) / 
+                           (thresholds['PID_MAX'] - thresholds['PID_MIN']) * 180)
+                servo_set_angle(angle)
+                
+                phase = classify_emg(smoothed_emg)
+                print(f"EMG:{smoothed_emg:.2f} PID:{adjustment:.2f} {angle}° [{phase}]", end='\r')
+                
             except:
                 pass
         else:
             servo_set_angle(0)
-            if hasattr(pid_controller, 'reset'): pid_controller.reset()
         
         time.sleep(0.02)
 
 # =========================
-# MAIN
+# MAIN LOOP
 # =========================
 try:
-    print("EMG PID Servo v1.5 | Button=Calib | Switch=PID")
+    print("EMG PID Servo v1.6 | Button=20s Calib | Switch=PID ON")
+    print("📊 0-5s RELAX → 5-15s MEDIUM → 15-20s FULL_FLEX")
+    
+    # Start threads
     threading.Thread(target=uart_reader, daemon=True).start()
+    threading.Thread(target=emg_pid_thread, daemon=True).start()
     
     last_button = 1
     while True:
         button = GPIO.input(BUTTON_PIN)
         
-        # Button press: Start 20s calibration
+        # Button: Start calibration
         if last_button == 1 and button == 0:
             if not calibrating and not calib_complete:
                 calibrating = True
@@ -227,12 +248,12 @@ try:
                 emg_data.clear()
                 no_flex_start = calibration_start_time
                 play_calib_sequence()
-                print("\n🚀 20s CALIBRATION: 0-5s RELAX → 5-15s MEDIUM → 15-20s FULL!")
-            
+                print("\n🚀 *** 20s CALIBRATION STARTED ***")
+                print("   0-5s: RELAX  | 5-15s: MEDIUM  | 15-20s: FULL FLEX!")
             elif calib_complete:
-                print("\n🔄 Recalibrate? Press again.")
+                print("\n🔄 Press to recalibrate")
         
-        # Progress display
+        # Calibration progress
         if calibrating:
             elapsed = time.time() - calibration_start_time
             if elapsed >= 20.0:
@@ -240,17 +261,20 @@ try:
                 process_calibration()
             else:
                 phase = "RELAX" if elapsed < 5 else "MEDIUM" if elapsed < 15 else "FULL"
-                print(f"Calib: {elapsed:.1f}s [{phase}]", end='\r')
+                print(f"Calib: {elapsed:5.1f}s [{phase:6}]", end='\r')
         
         last_button = button
         time.sleep(0.05)
 
 except KeyboardInterrupt:
-    print("\nShutdown...")
+    print("\nShutting down...")
 finally:
     running = False
     time.sleep(0.5)
+    servo.ChangeDutyCycle(0)
     servo.stop()
     buzzer.stop()
     GPIO.cleanup()
     ser.close()
+    print("✅ EMG PID Servo v1.6 shutdown complete")
+

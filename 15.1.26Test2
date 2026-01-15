@@ -1,4 +1,4 @@
-
+//4.10pm
 # EMG Threshold Servo v1.7 - FIXED PWM + THRESHOLD CONTROL
 import RPi.GPIO as GPIO
 import time
@@ -183,4 +183,18 @@ try:
                 print("\n🚀 20s CALIB: RELAX→MEDIUM→FULL")
         
         if calibrating and (time.time() - calibration_start_time) >= 20:
-            calibrating = F
+            calibrating = False
+            process_calibration()
+        
+        time.sleep(0.05)
+        last_button = button
+
+except KeyboardInterrupt:
+    print("\nShutdown...")
+finally:
+    running = False
+    servo_pwm.stop()
+    buzzer_pwm.stop()
+    GPIO.cleanup()
+    ser.close()
+    print("✅ v1.7 FIXED - Ready!")

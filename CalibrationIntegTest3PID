@@ -31,16 +31,20 @@ current_phase = "RELAX"
 thresholds = {'PID_KP': 0.20, 'PID_KI': 0.05, 'PID_KD': 0.05}
 
 # =========================
-# Hardware PWM Setup (Jitter-Free)
+# GPIO + PWM Setup (RPi5 FIXED)
 # =========================
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(SWITCH_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
 GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 GPIO.setup(BUZZER_PIN, GPIO.OUT)
+GPIO.setup(SERVO_PIN, GPIO.OUT)  # ← ADD THIS ONE LINE!
 
-# Hardware PWM for servo (no jitter!)
-servo = GPIO.PWM(SERVO_PIN, 50)  # 50Hz, GPIO18=PWM0
-servo.start(2.5)  # Neutral 1.5ms pulse
+# Hardware PWM (no jitter)
+buzzer = GPIO.PWM(BUZZER_PIN, 440)
+buzzer.stop()
+servo = GPIO.PWM(SERVO_PIN, 50)
+servo.start(2.5)
+
 
 buzzer = GPIO.PWM(BUZZER_PIN, 440)
 buzzer.stop()

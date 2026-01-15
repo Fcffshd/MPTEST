@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+# EMG PID Servo v1.7 - THRESHOLD PWM CONTROL + JITTER FIX
+import RPi.GPIO as GPIO
+import time
+import serial
+import threading
+import numpy as np
+
+# =========================
+# Pins (BCM)
+# =========================
+SWITCH_PIN = 27   # PID enable
+BUTTON_PIN = 22   # Calibrate
+BUZZER_PIN = 26   # Buzzer
+SERVO_PIN  = 18   # Hardware PWM0 (GPIO18)
+
+# =========================
+# Globals
+# =========================
+running = True
+pid_enabled = False
+calibrating = False
+calibration_start_time = 0
+emg_data = []
+calib_complete = False
+no_flex_start = 0
+smoothed_emg = 0.8
+current_phase = "RELAX"
+
+# Dynamic thresholds
+thresholds = {'PID_KP': 0.20, 'PID_KI': 0.05, 'PID_KD': 0.05}
+
+# =========================
+# Hardware PWM Setup (Jitter-Free)
+# =========================
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(SWITCH_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(BUZZER_PIN, GPIO.OUT)
+
+# Hardware PWM for servo (no jitter!)
+servo = GPIO.PWM(SERVO_PIN, 50)  # 50Hz, GPIO18=PWM0
+servo.start(2.5)  # Neutral 1.5ms pulse
+
+buzzer = GPIO.PWM(BUZZER_PIN, 440)
+buzzer.stop()
+
+ser = serial.Serial('/dev/ttyAMA0', 115200, timeout=0.05)
+
+# =========================
+# PID Class
+# =========================
+class PID:
+    def __init__(self, kp, ki, kd, min_out, max_out):
+        self.kp, self.ki, self.kd = kp, ki, kd
+        self.min_out, self.max_out = min_out, max_out
+        self.reset()
+
+    def reset(self):
+        self.prev_error = 0
+        self.integral = 0
+        self.last_time = time.time()
+
+    def update(self, setpoint, measurement):
+        dt = time.time() - self.last_time
+        if dt <= 0: return 0
+        error = setpoint - measurement
+        self.integral += error * dt
+        self.integral = max(-5, min(5, self.integral))
+        P, I, D = self.kp * error, self.ki * self.integral, self.kd * (error - self.prev_error) / dt
+        output = P + I + D
+        output = max(self.min_out, min(self.max_out, output))
+        self.prev_error = error
+        self.last_time = time.time()
+        return output
+
+# =========================
+# Threshold → PWM Mapping
+# =========================
+def classify_emg(emg_value):
+    """RELAX/MEDIUM/FULL → servo angle"""
+    global current_phase
+    
+    if emg_value < thresholds.get('MEDIUM_THRESHOLD', 1.0):
+        current_phase = "RELAX"
+        return 0      # 0°
+    elif emg_value < thresholds.get('FULL_THRESHOLD', 2.0):
+        current_phase = "MEDIUM"
+        return 90     # 90°
+    else:
+        current_phase = "FULL"
+        return 180    # 180°
+
+def threshold_pwm_control(raw_emg):
+    """Apply thresholds DIRECTLY to servo PWM"""
+    smooth_emg = 0.1 * raw_emg + 0.9 * smoothed_emg
+    
+    # DEAD SIMPLE: Threshold → Fixed Angles
+    angle = classify_emg(smooth_emg)
+    
+    # Smooth transition (reduce twitch)
+    global smoothed_angle
+    smoothed_angle = 0.3 * angle + 0.7 * getattr(globals(), 'smoothed_angle', angle)
+    
+    servo_set_angle(smoothed_angle)
+    return smooth_emg, smoothed_angle, current_phase
+
+def servo_set_angle(angle):
+    """Precise PWM duty cycle (1.0-12.0%)"""
+    duty = 2.5 + (10.0 - 2.5) * (angle / 180.0)  # 1.0ms→2.0ms pulse
+    servo.ChangeDutyCycle(duty)
+
+# =========================
+# 20s Calibration (MEAN/MEDIAN)
+# =========================
+def process_calibration():
+    global thresholds, calib_complete
+    
+    no_flex_data = np.array([v for ts, v in emg_data if no_flex_start <= ts < no_flex_start + 5])
+    medium_data = np.array([v for ts, v in emg_data if no_flex_start + 5 <= ts < no_flex_start + 15])
+    full_data = np.array([v for ts, v in emg_data if no_flex_start + 15 <= ts < no_flex_start + 20])
+    
+    # MEAN/MEDIAN thresholds
+    if len(no_flex_data) > 5:
+        thresholds['RELAX_MEAN'] = np.mean(no_flex_data)
+        thresholds['RELAX_MEDIAN'] = np.median(no_flex_data)
+        thresholds['RELAX_THRESHOLD'] = thresholds['RELAX_MEDIAN']
+    if len(medium_data) > 10:
+        thresholds['MEDIUM_MEAN'] = np.mean(medium_data)
+        thresholds['MEDIUM_MEDIAN'] = np.median(medium_data)
+        thresholds['MEDIUM_THRESHOLD'] = thresholds['MEDIUM_MEDIAN']
+    if len(full_data) > 5:
+        thresholds['FULL_MEAN'] = np.mean(full_data)
+        thresholds['FULL_MEDIAN'] = np.median(full_data)
+        thresholds['FULL_THRESHOLD'] = thresholds['FULL_MEDIAN']
+    
+    print("\n" + "="*80)
+    print("✅ THRESHOLDS SET - MOTOR PWM ACTIVE")
+    print("="*80)
+    print(f"RELAX:  MEAN={thresholds['RELAX_MEAN']:6.3f}V → 0°")
+    print(f"MEDIUM: MEAN={thresholds['MEDIUM_MEAN']:6.3f}V → 90°")
+    print(f"FULL:   MEAN={thresholds['FULL_MEAN']:6.3f}V → 180°")
+    print("="*80)
+    calib_complete = True
+
+# =========================
+# Buzzer
+# =========================
+def short_beep(duration=0.1, freq=2000):
+    buzzer.ChangeFrequency(freq)
+    buzzer.start(50)
+    time.sleep(duration)
+    buzzer.stop()
+
+def play_calib_sequence():
+    for _ in range(3): short_beep(0.1, 1500); time.sleep(0.1)
+    short_beep(0.5, 1000)
+
+# =========================
+# EMG Reader
+# =========================
+def uart_reader():
+    global smoothed_emg
+    while running:
+        try:
+            if ser.in_waiting > 0:
+                line = ser.readline().decode('utf-8').strip()
+                if line.startswith("EMG:"):
+                    voltage = float(line.split(":")[1].split("V")[0])
+                    smoothed_emg = 0.1 * voltage + 0.9 * smoothed_emg
+                    if calibrating: emg_data.append((time.time(), voltage))
+        except: pass
+        time.sleep(0.01)
+
+# =========================
+# Threshold PWM Thread (MAIN CONTROL)
+# =========================
+def threshold_pwm_thread():
+    global smoothed_angle
+    while running:
+        if calib_complete and GPIO.input(SWITCH_PIN):
+            try:
+                # Read EMG from UART
+                if ser.in_waiting > 0:
+                    line = ser.readline().decode('utf-8').strip()
+                    if line.startswith("EMG:"):
+                        raw_emg = float(line.split(":")[1].split("V")[0])
+                        
+                        # THRESHOLD → PWM!
+                        smooth_emg, angle, phase = threshold_pwm_control(raw_emg)
+                        
+                        print(f"EMG:{raw_emg:.2f}V [{phase}] → {angle:3.0f}°", end='\r')
+            except: pass
+        else:
+            servo_set_angle(0)
+        time.sleep(0.02)
+
+# =========================
+# MAIN
+# =========================
+try:
+    print("EMG Threshold Servo v1.7 | Button=Calib | Switch=MOTOR ON")
+    threading.Thread(target=uart_reader, daemon=True).start()
+    threading.Thread(target=threshold_pwm_thread, daemon=True).start()
+    
+    last_button = 1
+    while True:
+        button = GPIO.input(BUTTON_PIN)
+        if last_button == 1 and button == 0:
+            if not calibrating:
+                calibrating = True
+                calib_complete = False
+                calibration_start_time = time.time()
+                emg_data.clear()
+                no_flex_start = calibration_start_time
+                play_calib_sequence()
+                print("\n🚀 20s CALIB: RELAX→MEDIUM→FULL")
+        
+        if calibrating and (time.time() - calibration_start_time) >= 20:
+            calibrating = False
+            process_calibration()
+        
+        time.sleep(0.05)
+        last_button = button
+
+except KeyboardInterrupt:
+    print("\nShutdown...")
+finally:
+    running = False
+    servo.stop()
+    GPIO.cleanup()
+    ser.close()
+    print("✅ Threshold PWM Control Ready!")

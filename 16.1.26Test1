@@ -1,0 +1,239 @@
+//11:58am
+# EMG Threshold Servo v1.8 - ENHANCED CALIBRATION UI
+import RPi.GPIO as GPIO
+import time
+import serial
+import threading
+import numpy as np
+
+# =========================
+# Pins (BCM)
+# =========================
+SWITCH_PIN = 27   # PID enable / MOTOR ON
+BUTTON_PIN = 22   # Calibrate
+BUZZER_PIN = 26   # Buzzer
+SERVO_PIN  = 18   # Hardware PWM0 (GPIO18)
+
+# =========================
+# Globals
+# =========================
+running = True
+calibrating = False
+calibration_start_time = 0
+emg_data = []
+calib_complete = False
+no_flex_start = 0
+smoothed_emg = 0.8
+current_phase = "RELAX"
+smoothed_angle = 0
+
+# Dynamic thresholds
+thresholds = {'PID_KP': 0.20, 'PID_KI': 0.05, 'PID_KD': 0.05}
+
+# =========================
+# GPIO + PWM Setup (COMPLETELY FIXED)
+# =========================
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(SWITCH_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(BUZZER_PIN, GPIO.OUT)
+GPIO.setup(SERVO_PIN, GPIO.OUT)     # REQUIRED for PWM!
+
+# SINGLE PWM objects (no duplicates!)
+buzzer_pwm = GPIO.PWM(BUZZER_PIN, 440)
+servo_pwm = GPIO.PWM(SERVO_PIN, 50)  # 50Hz hardware PWM0
+buzzer_pwm.stop()
+servo_pwm.start(2.5)  # Neutral position
+
+ser = serial.Serial('/dev/ttyAMA0', 115200, timeout=0.05)
+
+# =========================
+# Threshold → Servo Mapping
+# =========================
+def classify_emg(emg_value):
+    """EMG → Fixed servo angles by threshold"""
+    global current_phase
+    med_threshold = thresholds.get('MEDIUM_THRESHOLD', 1.0)
+    full_threshold = thresholds.get('FULL_THRESHOLD', 2.0)
+    
+    if emg_value < med_threshold:
+        current_phase = "RELAX"
+        return 0      # 0°
+    elif emg_value < full_threshold:
+        current_phase = "MEDIUM"
+        return 90     # 90°
+    else:
+        current_phase = "FULL"
+        return 180    # 180°
+
+def servo_set_angle(angle):
+    """Stable PWM duty cycle"""
+    duty = 2.5 + (10.0 - 2.5) * (angle / 180.0)
+    servo_pwm.ChangeDutyCycle(duty)
+
+def threshold_pwm_control(raw_emg):
+    """Threshold → Smooth servo movement"""
+    global smoothed_emg, smoothed_angle
+    smoothed_emg = 0.1 * raw_emg + 0.9 * smoothed_emg
+    
+    target_angle = classify_emg(smoothed_emg)
+    smoothed_angle = 0.4 * target_angle + 0.6 * smoothed_angle  # Smooth
+    
+    servo_set_angle(smoothed_angle)
+    return smoothed_emg, smoothed_angle, current_phase
+
+# =========================
+# 20s Calibration (MEAN/MEDIAN)
+# =========================
+def process_calibration():
+    """Set MEAN/MEDIAN thresholds"""
+    global thresholds, calib_complete
+    
+    no_flex_data = np.array([v for ts, v in emg_data if no_flex_start <= ts < no_flex_start + 5])
+    medium_data = np.array([v for ts, v in emg_data if no_flex_start + 5 <= ts < no_flex_start + 15])
+    full_data = np.array([v for ts, v in emg_data if no_flex_start + 15 <= ts < no_flex_start + 20])
+    
+    if len(no_flex_data) > 5:
+        thresholds['RELAX_MEAN'] = np.mean(no_flex_data)
+        thresholds['RELAX_MEDIAN'] = np.median(no_flex_data)
+    if len(medium_data) > 10:
+        thresholds['MEDIUM_MEAN'] = np.mean(medium_data)
+        thresholds['MEDIUM_MEDIAN'] = np.median(medium_data)
+        thresholds['MEDIUM_THRESHOLD'] = thresholds['MEDIUM_MEDIAN']
+    if len(full_data) > 5:
+        thresholds['FULL_MEAN'] = np.mean(full_data)
+        thresholds['FULL_MEDIAN'] = np.median(full_data)
+        thresholds['FULL_THRESHOLD'] = thresholds['FULL_MEDIAN']
+    
+    print("\n" + "="*80)
+    print("✅ THRESHOLDS READY - FLIP SWITCH 27 ON FOR MOTOR!")
+    print("="*80)
+    print(f"RELAX:  MEAN={thresholds.get('RELAX_MEAN',0):6.3f}V → 0°")
+    print(f"MEDIUM: MEAN={thresholds.get('MEDIUM_MEAN',0):6.3f}V → 90°")
+    print(f"FULL:   MEAN={thresholds.get('FULL_MEAN',0):6.3f}V → 180°")
+    print("="*80)
+    calib_complete = True
+
+# =========================
+# Buzzer
+# =========================
+def short_beep(duration=0.1, freq=2000):
+    buzzer_pwm.ChangeFrequency(freq)
+    buzzer_pwm.start(50)
+    time.sleep(duration)
+    buzzer_pwm.stop()
+
+def play_calib_sequence():
+    for _ in range(3): short_beep(0.1, 1500); time.sleep(0.1)
+    short_beep(0.5, 1000)
+
+# =========================
+# EMG Reader Thread
+# =========================
+def uart_reader():
+    global smoothed_emg
+    while running:
+        try:
+            if ser.in_waiting > 0:
+                line = ser.readline().decode('utf-8', errors='ignore').strip()
+                if line.startswith("EMG:"):
+                    voltage = float(line.split(":")[1].split("V")[0])
+                    smoothed_emg = 0.1 * voltage + 0.9 * smoothed_emg
+                    if calibrating: emg_data.append((time.time(), voltage))
+        except: pass
+        time.sleep(0.01)
+
+# =========================
+# Threshold PWM Control Thread
+# =========================
+def threshold_pwm_thread():
+    while running:
+        if calib_complete and GPIO.input(SWITCH_PIN):  # MOTOR ON!
+            try:
+                if ser.in_waiting > 0:
+                    line = ser.readline().decode('utf-8', errors='ignore').strip()
+                    if line.startswith("EMG:"):
+                        raw_emg = float(line.split(":")[1].split("V")[0])
+                        smooth_emg, angle, phase = threshold_pwm_control(raw_emg)
+                        print(f"EMG:{raw_emg:.2f}V [{phase}] {angle:3.0f}°", end='\r')
+            except: pass
+        else:
+            servo_set_angle(0)
+        time.sleep(0.02)
+
+# =========================
+# MAIN LOOP - ENHANCED CALIBRATION UI
+# =========================
+# Start EMG reader thread
+threading.Thread(target=uart_reader, daemon=True).start()
+
+try:
+    print("🎯 EMG Calibration Ready | Press button for 20s sequence")
+    print("📊 0–5 s: RELAX | 5–15 s: MEDIUM | 15–20 s: FULL")
+
+    button_last_state = GPIO.input(BUTTON_PIN)
+
+    while True:
+        button_state = GPIO.input(BUTTON_PIN)
+
+        # --- Button press (falling edge) ---
+        if button_last_state == 1 and button_state == 0:
+            if not calibrating and not calib_complete:
+                # START CALIBRATION
+                calibrating = True
+                calib_complete = False
+                calibration_start_time = time.time()
+                emg_data.clear()
+                no_flex_start = calibration_start_time
+
+                play_calib_sequence()
+                print("\n\n🚀 *** CALIBRATION STARTED ***")
+                print("   ➤ 0–5 s  : RELAX (NO_FLEX)")
+                print("   ➤ 5–15 s : MEDIUM FLEX")
+                print("   ➤ 15–20 s: FULL FLEX (MAX EFFORT)")
+                print("--------------------------------------------------")
+            elif calib_complete:
+                print("\n🔄 Calibration already done. Press again to recalibrate.")
+
+        button_last_state = button_state
+
+        # --- Calibration timing + phase prompts ---
+        if calibrating:
+            elapsed = time.time() - calibration_start_time
+
+            # One clear line showing time + phase, not overwritten by EMG prints
+            if elapsed < 5:
+                phase_msg = "RELAX (NO_FLEX)"
+            elif elapsed < 15:
+                phase_msg = "MEDIUM FLEX"
+            else:
+                phase_msg = "FULL FLEX (MAX EFFORT!)"
+
+            print(f"\r⏱  Calibrating: {elapsed:4.1f} s  |  Phase: {phase_msg:<22}", end="")
+
+            if elapsed >= 20.0:
+                calibrating = False
+                calib_complete = True
+                play_calib_sequence()
+                print("\n\n✅ Calibration window complete. Processing thresholds...")
+                process_calibration()
+                print("✅ Calibration done. Flip the switch to enable motor.\n")
+
+        else:
+            # Normal status when not calibrating (optional)
+            switch_state = GPIO.input(SWITCH_PIN)
+            status = f"Mode: {'CALIB' if calibrating else 'RUN'} | " \
+                     f"Motor: {'ON' if switch_state and calib_complete else 'OFF'}"
+            print(f"\r{status:<60}", end="")
+
+        time.sleep(0.02)
+
+except KeyboardInterrupt:
+    print("\nShutting down...")
+finally:
+    running = False
+    servo_pwm.stop()
+    buzzer_pwm.stop()
+    GPIO.cleanup()
+    ser.close()
+    print("✅ Exit complete.")

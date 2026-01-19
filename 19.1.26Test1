@@ -1,0 +1,133 @@
+# rpi5_emg_servo_linear.py
+# UART RX (GPIO15, /dev/ttyAMA0) → Servo PWM (GPIO18)
+# Voltage range 0.8–1.8 V mapped linearly to 0–180 degrees
+
+import RPi.GPIO as GPIO
+import serial
+import time
+import threading
+
+# ------------ USER SETTINGS ------------
+UART_PORT   = "/dev/ttyAMA0"   # Ensure enabled in raspi-config / config.txt
+UART_BAUD   = 115200
+
+SERVO_PIN   = 18               # GPIO18 = hardware PWM0
+PWM_FREQ    = 50               # 50 Hz for hobby servo
+
+V_MIN       = 0.8              # volts → 0°
+V_MAX       = 1.8              # volts → 180°
+# --------------------------------------
+
+
+# ===== GPIO + PWM SETUP =====
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(SERVO_PIN, GPIO.OUT)
+
+servo = GPIO.PWM(SERVO_PIN, PWM_FREQ)
+servo.start(0)  # 0% duty initially
+
+
+# ===== SERVO HELPERS (HS-311‑style range) =====
+def angle_to_duty(angle: float) -> float:
+    """
+    Map 0–180° to a conservative 0.9–2.1 ms pulse at 50 Hz.
+    20 ms period → duty% = pulse_us / 20000 * 100
+    """
+    angle = max(0.0, min(180.0, float(angle)))
+    pulse_us = 900 + (2100 - 900) * (angle / 180.0)
+    duty = (pulse_us / 20000.0) * 100.0
+    return duty
+
+
+def servo_set_angle(angle: float):
+    duty = angle_to_duty(angle)
+    servo.ChangeDutyCycle(duty)
+
+
+# ===== LINEAR VOLTAGE → ANGLE MAPPING =====
+def voltage_to_angle(v: float) -> float:
+    """
+    Linear map:
+      V_MIN → 0°
+      V_MAX → 180°
+    with clamping outside the range.
+    """
+    if v <= V_MIN:
+        return 0.0
+    if v >= V_MAX:
+        return 180.0
+    span = V_MAX - V_MIN
+    return (v - V_MIN) / span * 180.0
+
+
+# ===== UART READER THREAD =====
+running = True
+
+def uart_reader():
+    global running
+    while running:
+        try:
+            line = ser.readline().decode(errors="ignore").strip()
+            # Expecting lines like: "EMG: 1.288 V"
+            if line.startswith("EMG:"):
+                try:
+                    # Split off the number before the unit
+                    emg_str = line.split(":")[1].strip().split()[0]
+                    emg_v = float(emg_str)
+
+                    angle = voltage_to_angle(emg_v)
+                    print(f"RX '{line}'  ->  {emg_v:.3f} V  ->  {angle:.1f}°")
+                    servo_set_angle(angle)
+
+                except (ValueError, IndexError):
+                    print("Parse error:", line)
+        except Exception as e:
+            # For robustness – avoid killing the thread on bad UART
+            print("UART error:", e)
+            time.sleep(0.01)
+
+        time.sleep(0.001)  # Light CPU throttling
+
+
+# ===== MAIN =====
+try:
+    # Open serial AFTER defining uart_reader() to avoid race conditions
+    ser = serial.Serial(UART_PORT, UART_BAUD, timeout=0.1)
+
+    print("EMG → Servo ready.")
+    print(f"Voltage mapping: {V_MIN} V → 0°, {V_MAX} V → 180°")
+    print(f"UART: {UART_PORT} @ {UART_BAUD} baud")
+    print("Expecting lines like:  'EMG: 1.234 V'")
+
+    # Optional startup sweep to verify servo travel
+    for v in [V_MIN, (V_MIN+V_MAX)/2, V_MAX]:
+        a = voltage_to_angle(v)
+        print(f"Startup test: {v:.2f} V → {a:.1f}°")
+        servo_set_angle(a)
+        time.sleep(1.0)
+
+    # Start reader thread
+    t = threading.Thread(target=uart_reader, daemon=True)
+    t.start()
+
+    # Idle loop – all action happens in UART thread
+    while True:
+        time.sleep(0.1)
+
+except KeyboardInterrupt:
+    pass
+
+finally:
+    running = False
+    try:
+        servo.ChangeDutyCycle(0)
+    except:
+        pass
+    time.sleep(0.5)
+    servo.stop()
+    GPIO.cleanup()
+    try:
+        ser.close()
+    except:
+        pass
+    print("\nClean exit.")

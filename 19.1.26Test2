@@ -1,0 +1,206 @@
+# version 1.6 - EMG VOLTAGE → SERVO POSITION
+# Added EMA smoothing + angle deadband
+import RPi.GPIO as GPIO
+import time
+import serial
+import threading
+
+# Pins
+SWITCH_PIN = 27
+BUTTON_PIN = 22
+BUZZER_PIN = 26
+SERVO_PIN  = 18
+
+Calibration_Flag = False
+running = True
+
+# GPIO setup
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(SWITCH_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(BUZZER_PIN, GPIO.OUT)
+GPIO.setup(SERVO_PIN, GPIO.OUT)
+
+buzzer = GPIO.PWM(BUZZER_PIN, 440)
+buzzer.stop()
+
+servo = GPIO.PWM(SERVO_PIN, 50)   # 50 Hz servo PWM
+servo.start(0)
+
+# ===== UART =====
+ser = serial.Serial('/dev/ttyAMA0', 115200)
+
+# =========================
+# HS-311 SERVO FUNCTIONS
+# =========================
+def angle_to_duty(angle):
+    """Hitec HS-311: safer 900–2100µs range"""
+    angle = max(0, min(180, angle))
+    pulse_us = 900 + (2100-900) * (angle / 180.0)
+    return round((pulse_us / 20000.0) * 100.0, 2)
+
+def servo_set_angle(angle):
+    duty = angle_to_duty(angle)
+    servo.ChangeDutyCycle(duty)
+
+# =========================
+# EMG → ANGLE MAPPING
+# =========================
+V_MIN = 0.8   # 0°
+V_MAX = 1.8   # 180°
+
+def voltage_to_angle(voltage):
+    """Linear: 0.8V→0°, 1.8V→180°"""
+    if voltage <= V_MIN:
+        return 0
+    elif voltage >= V_MAX:
+        return 180
+    else:
+        return (voltage - V_MIN) / (V_MAX - V_MIN) * 180.0
+
+# =========================
+# EMA + ANGLE STABILISER
+# =========================
+alpha = 0.2            # EMA smoothing factor (lower = smoother, slower)
+ema_v = None
+
+ANGLE_DEADBAND = 3.0   # ignore <3° change
+ANGLE_MAX_STEP = 15.0  # max degrees per update
+
+last_angle = None
+
+def ema_filter(v_new):
+    global ema_v
+    if ema_v is None:
+        ema_v = v_new
+    else:
+        ema_v = alpha * v_new + (1 - alpha) * ema_v
+    return ema_v
+
+def stable_angle_from_voltage(v):
+    global last_angle
+    raw = voltage_to_angle(v)
+
+    if last_angle is None:
+        last_angle = raw
+        return raw
+
+    # deadband
+    if abs(raw - last_angle) < ANGLE_DEADBAND:
+        return last_angle
+
+    # rate limiting to stop big jumps
+    if raw > last_angle + ANGLE_MAX_STEP:
+        last_angle += ANGLE_MAX_STEP
+    elif raw < last_angle - ANGLE_MAX_STEP:
+        last_angle -= ANGLE_MAX_STEP
+    else:
+        last_angle = raw
+
+    return last_angle
+
+# =========================
+# STARTUP TEST
+# =========================
+print("🧪 HS-311 servo startup test (0.8–1.8V EMA)...")
+test_volts = [0.8, 1.0, 1.3, 1.5, 1.8, 1.3, 0.8]
+for v in test_volts:
+    vf = ema_filter(v)
+    ang = stable_angle_from_voltage(vf)
+    print(f"  {v:.2f}V (EMA={vf:.3f}) → {ang:.1f}°")
+    servo_set_angle(ang)
+    time.sleep(1)
+print("EMG Servo Control Ready! (EMA + deadband)")
+
+# Buzzer/melody (unchanged)
+NOTE_E5=659;NOTE_D5=587;NOTE_FS4=370;NOTE_GS4=415
+NOTE_CS5=554;NOTE_B4=494;NOTE_D4=294;NOTE_E4=330
+NOTE_A4=440;NOTE_CS4=277
+
+melody = [NOTE_E5,NOTE_D5,NOTE_FS4,NOTE_GS4,NOTE_CS5,NOTE_B4,NOTE_D4,NOTE_E4,NOTE_B4,NOTE_A4,NOTE_CS4,NOTE_E4,NOTE_A4]
+durations = [8,8,4,4,8,8,4,4,8,8,4,4,2]
+
+def play_note(freq, duration_s):
+    if freq <= 0:
+        buzzer.stop(); time.sleep(duration_s); return
+    buzzer.ChangeFrequency(freq)
+    buzzer.start(50)
+    time.sleep(duration_s * 0.9)
+    buzzer.stop()
+    time.sleep(duration_s * 0.1)
+
+def play_melody():
+    for i,d in enumerate(durations):
+        play_note(melody[i], 1000/d/1000)
+
+def short_beep(duration=0.1, freq=2000):
+    buzzer.ChangeFrequency(freq)
+    buzzer.start(50)
+    time.sleep(duration)
+    buzzer.stop()
+
+# =========================
+# EMG UART THREAD (with EMA)
+# =========================
+def uart_reader():
+    global running
+    while running:
+        try:
+            line = ser.readline().decode(errors="ignore").strip()
+            if not line:
+                continue
+
+            # Expect "EMG: 1.288 V"
+            if line.startswith("EMG:") and line.endswith("V"):
+                try:
+                    parts = line.split()
+                    # ["EMG:", "1.288", "V"]
+                    emg_str = parts[1]
+                    emg_voltage = float(emg_str)
+
+                    v_filt = ema_filter(emg_voltage)
+                    target_angle = stable_angle_from_voltage(v_filt)
+
+                    print(f"EMG raw={emg_voltage:.3f}V EMA={v_filt:.3f}V → {target_angle:.1f}°")
+                    servo_set_angle(target_angle)
+
+                except (ValueError, IndexError) as e:
+                    print("Parse fail:", e, "|", repr(line))
+        except Exception as e:
+            print("UART error:", e)
+            time.sleep(0.01)
+
+        time.sleep(0.005)   # light CPU, ~200 Hz max updates
+
+# =========================
+# Main
+# =========================
+try:
+    print("EMG Servo: 0.8V=0° | 1.3V≈90° | 1.8V=180° | EMA+deadband | Button=Melody")
+    threading.Thread(target=uart_reader, daemon=True).start()
+
+    last_button = GPIO.input(BUTTON_PIN)
+    while True:
+        button_pressed = (GPIO.input(BUTTON_PIN) == 0)
+
+        if last_button == 1 and GPIO.input(BUTTON_PIN) == 0:
+            Calibration_Flag = True
+            print("\n🎵 Calibration ON")
+            short_beep(0.1, 2500)
+            play_melody()
+
+        last_button = GPIO.input(BUTTON_PIN)
+        print(f"B:{'P' if button_pressed else '-'} F:{Calibration_Flag} | EMA={ema_v if ema_v is not None else 0:.3f}V", end='\r')
+        time.sleep(0.02)
+
+except KeyboardInterrupt:
+    pass
+finally:
+    running = False
+    servo.ChangeDutyCycle(0)
+    time.sleep(0.5)
+    servo.stop()
+    buzzer.stop()
+    GPIO.cleanup()
+    ser.close()
+    print("\nDone!")

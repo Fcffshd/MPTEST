@@ -1,0 +1,69 @@
+#21.1.26
+# DS5180 Servo Mapping Test - 0° to 180° sweep only
+# Finds PWM values for YOUR physical 0° and 180° positions
+import RPi.GPIO as GPIO
+import time
+
+SERVO_PIN = 18  # GPIO18 hardware PWM
+PWM_FREQ = 50   # 50 Hz (20ms period)
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(SERVO_PIN, GPIO.OUT)
+servo = GPIO.PWM(SERVO_PIN, PWM_FREQ)
+servo.start(0)
+
+def angle_to_pulse(angle):
+    """Map 0-180° to 500-2500µs (DS5180 full range, but only use 0-180)"""
+    angle = max(0, min(180, angle))
+    pulse_us = 500 + (2500 - 500) * (angle / 180.0)  # Full servo capability
+    duty = (pulse_us / 20000.0) * 100.0
+    return round(duty, 2)
+
+def servo_goto_angle(angle_deg):
+    duty = angle_to_pulse(angle_deg)
+    print(f"Angle {angle_deg:3d}° → {angle_to_pulse(angle_deg):4.0f}µs → duty {duty:5.2f}%")
+    servo.ChangeDutyCycle(duty)
+
+try:
+    print("🧪 DS5180 0°-180° Mapping Test")
+    print("Mark your ACTUAL 0° and 180° positions!")
+    
+    # 1. Test 0° position
+    print("\n=== 0° POSITION ===")
+    servo_goto_angle(0)
+    input("Press Enter after marking 0° position...")
+    
+    # 2. Test 90° (middle)
+    print("\n=== 90° POSITION ===")
+    servo_goto_angle(90)
+    time.sleep(2)
+    
+    # 3. Test 180° position  
+    print("\n=== 180° POSITION ===")
+    servo_goto_angle(180)
+    input("Press Enter after marking 180° position...")
+    
+    # 4. Slow sweep 0→180→0 to verify
+    print("\n=== FULL 0-180° SWEEP ===")
+    print("Should move smoothly between your marked positions.")
+    for angle in range(0, 181, 3):
+        servo_goto_angle(angle)
+        time.sleep(0.08)
+    
+    for angle in range(180, -1, -3):
+        servo_goto_angle(angle)
+        time.sleep(0.08)
+    
+    print("\n✅ Test complete!")
+    print("Use this mapping in your main code:")
+    print("  PULSE_MIN =", angle_to_pulse(0), "µs (0°)")
+    print("  PULSE_MAX =", angle_to_pulse(180), "µs (180°)")
+    
+except KeyboardInterrupt:
+    pass
+finally:
+    servo.ChangeDutyCycle(0)
+    time.sleep(1)
+    servo.stop()
+    GPIO.cleanup()
+    print("Servo stopped - safe to disconnect.")

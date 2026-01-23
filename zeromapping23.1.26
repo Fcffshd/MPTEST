@@ -1,0 +1,39 @@
+# DDServo 0° Test - Run this standalone first!
+import RPi.GPIO as GPIO
+import time
+
+SERVO_PIN = 18
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(SERVO_PIN, GPIO.OUT)
+
+servo = GPIO.PWM(SERVO_PIN, 50)  # 50Hz = 20ms period
+servo.start(0)
+
+def ddservo_zero():
+    """DDServo: 500µs = 0° TOP position"""
+    duty = 500 / 20000 * 100  # 2.50%
+    print(f"0° → {duty:.2f}% duty (500µs)")
+    servo.ChangeDutyCycle(duty)
+
+try:
+    print("🧭 DDServo 0° calibration")
+    print("Mark this as TOP/0° position!")
+    ddservo_zero()
+    time.sleep(3)  # Hold 3s
+    
+    # Full map for reference
+    print("\nFull DDServo map (500-2083µs):")
+    print("Angle | µs   | Duty%")
+    print("------+-------+------")
+    for angle in [0, 30, 60, 90, 120, 150, 180]:
+        pulse_us = 500 + (2083-500) * (angle/180)
+        duty = pulse_us / 20000 * 100
+        print(f"{angle:3d}°  | {pulse_us:5.0f}µs | {duty:5.2f}%")
+    
+except KeyboardInterrupt:
+    pass
+finally:
+    servo.ChangeDutyCycle(0)
+    servo.stop()
+    GPIO.cleanup()
+    print("\n✅ 0° = 2.50% duty. Use in your main code!")

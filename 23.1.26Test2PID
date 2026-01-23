@@ -1,0 +1,370 @@
+# EMG PID + Baseline v3.0
+# - 20s BASELINE CALIB (0–10s baseline, 10–20s effort)
+# - EMA + angle stabilizer
+# - PID on EMG (FULL target) mapped to servo
+import RPi.GPIO as GPIO
+import time
+import serial
+import threading
+import numpy as np
+
+# =========================
+# Pins (BCM)
+# =========================
+SWITCH_PIN = 27   # MOTOR / PID ON
+BUTTON_PIN = 22   # Calibrate
+BUZZER_PIN = 26   # Buzzer
+SERVO_PIN  = 18   # Hardware PWM0 (GPIO18)
+
+# =========================
+# Globals
+# =========================
+running = True
+calibrating = False
+calibration_start_time = 0
+emg_data = []
+calib_complete = False
+no_flex_start = 0
+
+smoothed_emg = 1.5
+current_phase = "RELAX"
+
+smoothed_angle = 0
+last_angle = None
+
+# Dynamic thresholds
+thresholds = {
+    # PID defaults; will be used together with baseline thresholds
+    'PID_KP': 0.20,
+    'PID_KI': 0.05,
+    'PID_KD': 0.05
+}
+
+# EMA + stabilizer
+EMA_ALPHA = 0.15      # EMG smoothing
+ANGLE_DEADBAND = 2.0  # ignore <2° changes
+ANGLE_MAX_STEP = 12.0 # max degrees per update
+
+# =========================
+# GPIO + PWM Setup
+# =========================
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(SWITCH_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(BUZZER_PIN, GPIO.OUT)
+GPIO.setup(SERVO_PIN, GPIO.OUT)
+
+buzzer_pwm = GPIO.PWM(BUZZER_PIN, 440)
+servo_pwm  = GPIO.PWM(SERVO_PIN, 50)
+
+buzzer_pwm.stop()
+servo_pwm.start(0)
+
+ser = serial.Serial('/dev/ttyAMA0', 115200, timeout=0.05)
+
+# =========================
+# PID Controller (from v1.6)
+# =========================
+class PID:
+    def __init__(self, kp, ki, kd, min_out, max_out):
+        self.kp, self.ki, self.kd = kp, ki, kd
+        self.min_out, self.max_out = min_out, max_out
+        self.reset()
+
+    def reset(self):
+        self.prev_error = 0
+        self.integral = 0
+        self.last_time = time.time()
+
+    def update(self, setpoint, measurement):
+        current_time = time.time()
+        dt = current_time - self.last_time
+        if dt <= 0:
+            return 0
+
+        error = setpoint - measurement
+        self.integral += error * dt
+        # anti-windup
+        self.integral = max(-10, min(10, self.integral))
+
+        P = self.kp * error
+        I = self.ki * self.integral
+        D = self.kd * (error - self.prev_error) / dt
+
+        output = P + I + D
+        output = max(self.min_out, min(self.max_out, output))
+
+        self.prev_error = error
+        self.last_time = current_time
+        return output
+
+# =========================
+# Servo functions (DS5180 style)
+# =========================
+def angle_to_duty(angle):
+    """DS5180: 500µs=0° → 2500µs=270° capability, but map 0-180° linearly"""
+    angle = max(0, min(180, angle))  # clamp
+    pulse_us = 500 + (2500 - 500) * (angle / 180.0)
+    return round((pulse_us / 20000.0) * 100.0, 2)
+
+def servo_set_angle(angle):
+    duty = angle_to_duty(angle)
+    servo_pwm.ChangeDutyCycle(duty)
+
+# =========================
+# EMA + angle stabilizer
+# =========================
+def ema_filter(raw_v):
+    global smoothed_emg
+    smoothed_emg = EMA_ALPHA * raw_v + (1 - EMA_ALPHA) * smoothed_emg
+    return smoothed_emg
+
+def stable_angle(target_angle):
+    global last_angle, smoothed_angle
+
+    if last_angle is None:
+        last_angle = target_angle
+        smoothed_angle = target_angle
+        return target_angle
+
+    # deadband
+    if abs(target_angle - last_angle) < ANGLE_DEADBAND:
+        return last_angle
+
+    # rate limiting
+    if target_angle > last_angle + ANGLE_MAX_STEP:
+        last_angle += ANGLE_MAX_STEP
+    elif target_angle < last_angle - ANGLE_MAX_STEP:
+        last_angle -= ANGLE_MAX_STEP
+    else:
+        last_angle = target_angle
+
+    # smooth the final output (angle space)
+    smoothed_angle = 0.4 * last_angle + 0.6 * smoothed_angle
+    return smoothed_angle
+
+# =========================
+# Phase classifier (reuse thresholds)
+# =========================
+def classify_emg(emg_value):
+    baseline = thresholds.get('BASELINE', 1.8)
+    medium_th = thresholds.get('MEDIUM_THRESHOLD', baseline + 0.2)
+
+    if emg_value < baseline:
+        return "RELAX"
+    elif emg_value < medium_th:
+        return "MEDIUM"
+    else:
+        return "FULL"
+
+# =========================
+# BASELINE CALIBRATION (0–10s baseline, 10–20s effort)
+# =========================
+def process_calibration():
+    global thresholds, calib_complete
+
+    baseline_data = np.array(
+        [v for ts, v in emg_data if no_flex_start <= ts < no_flex_start + 10]
+    )
+    effort_data = np.array(
+        [v for ts, v in emg_data if no_flex_start + 10 <= ts < no_flex_start + 20]
+    )
+
+    if len(baseline_data) > 10:
+        thresholds['BASELINE'] = np.percentile(baseline_data, 25)
+        thresholds['BASELINE_MEAN'] = np.mean(baseline_data)
+
+    if len(effort_data) > 15:
+        thresholds['MEDIUM_THRESHOLD'] = np.percentile(effort_data, 40)
+        thresholds['MEDIUM_MEAN'] = np.mean(effort_data[:len(effort_data)//2])
+        thresholds['FULL_MEAN'] = np.mean(effort_data[len(effort_data)//2:])
+
+    # Define EMG range for PID:
+    # PID_MIN near baseline, PID_MAX near strong effort (use FULL_MEAN fallback)
+    pid_min = thresholds.get('BASELINE', thresholds.get('BASELINE_MEAN', 1.5))
+    pid_max = thresholds.get('FULL_MEAN', thresholds.get('MEDIUM_THRESHOLD', pid_min + 0.8))
+    if pid_max <= pid_min:
+        pid_max = pid_min + 0.5
+
+    thresholds['PID_MIN'] = pid_min
+    thresholds['PID_MAX'] = pid_max
+
+    print("\n" + "="*80)
+    print("✅ BASELINE + PID RANGE READY - FLIP SWITCH 27 ON!")
+    print("="*80)
+    print(f"BASELINE: {thresholds.get('BASELINE_MEAN',0):6.3f}V (25th={thresholds.get('BASELINE',0):6.3f}V)")
+    print(f"MEDIUM:   MEAN={thresholds.get('MEDIUM_MEAN',0):6.3f}V (th={thresholds.get('MEDIUM_THRESHOLD',0):6.3f}V)")
+    print(f"FULL:     MEAN={thresholds.get('FULL_MEAN',0):6.3f}V")
+    print(f"PID Range: {thresholds['PID_MIN']:5.3f}V → {thresholds['PID_MAX']:5.3f}V")
+    print("="*80)
+
+    calib_complete = True
+
+# =========================
+# Buzzer + melody
+# =========================
+def short_beep(duration=0.1, freq=2000):
+    buzzer_pwm.ChangeFrequency(freq)
+    buzzer_pwm.start(50)
+    time.sleep(duration)
+    buzzer_pwm.stop()
+
+def play_calib_sequence():
+    for _ in range(3):
+        short_beep(0.1, 1500)
+        time.sleep(0.1)
+    short_beep(0.5, 1000)
+
+NOTE_E5=659;NOTE_D5=587;NOTE_FS4=370;NOTE_GS4=415
+NOTE_CS5=554;NOTE_B4=494;NOTE_D4=294;NOTE_E4=330
+NOTE_A4=440;NOTE_CS4=277
+
+melody = [NOTE_E5,NOTE_D5,NOTE_FS4,NOTE_GS4,NOTE_CS5,NOTE_B4,
+          NOTE_D4,NOTE_E4,NOTE_B4,NOTE_A4,NOTE_CS4,NOTE_E4,NOTE_A4]
+durations = [8,8,4,4,8,8,4,4,8,8,4,4,2]
+
+def play_melody():
+    for i,d in enumerate(durations):
+        short_beep(1000/d/1000, melody[i])
+
+# =========================
+# UART reader (EMA + log for calib)
+# =========================
+def uart_reader():
+    global emg_data
+    while running:
+        try:
+            if ser.in_waiting > 0:
+                line = ser.readline().decode('utf-8', errors='ignore').strip()
+                if line.startswith("EMG:"):
+                    voltage = float(line.split(":")[1].split("V")[0])
+                    # For calibration, store raw
+                    if calibrating:
+                        emg_data.append((time.time(), voltage))
+                    # Always keep an EMA up to date
+                    ema_filter(voltage)
+        except:
+            pass
+        time.sleep(0.01)
+
+# =========================
+# EMG→Servo PID thread
+# =========================
+def emg_pid_thread():
+    global current_phase
+    pid_controller = None
+
+    while running:
+        try:
+            switch_state = GPIO.input(SWITCH_PIN)
+
+            if calib_complete and switch_state:
+                # Ensure PID exists with current PID range
+                if pid_controller is None:
+                    pid_controller = PID(
+                        thresholds['PID_KP'],
+                        thresholds['PID_KI'],
+                        thresholds['PID_KD'],
+                        thresholds['PID_MIN'],
+                        thresholds['PID_MAX']
+                    )
+                    pid_controller.reset()
+
+                # PID: aim for FULL_MEAN as "max clench" EMG
+                setpoint = thresholds.get('FULL_MEAN', thresholds['PID_MAX'])
+                # controller works in EMG space
+                adjustment = pid_controller.update(setpoint, smoothed_emg)
+                target_emg = smoothed_emg + adjustment
+                target_emg = max(thresholds['PID_MIN'],
+                                 min(thresholds['PID_MAX'], target_emg))
+
+                # map EMG range → 0–180°
+                angle = int(
+                    (target_emg - thresholds['PID_MIN']) /
+                    (thresholds['PID_MAX'] - thresholds['PID_MIN']) * 180
+                )
+                angle = max(0, min(180, angle))
+                angle = stable_angle(angle)
+
+                current_phase = classify_emg(smoothed_emg)
+                servo_set_angle(angle)
+
+                print(
+                    f"\rEMG:{smoothed_emg:.3f}V PID:{adjustment:.3f} "
+                    f"{angle:3.0f}° [{current_phase}]", end=""
+                )
+            else:
+                # motor off, reset PID
+                servo_set_angle(0)
+                pid_controller = None
+                status = f"Mode:{'CALIB' if calibrating else 'BASELINE'} | Motor:{'ON' if switch_state and calib_complete else 'OFF'}"
+                print(f"\r{status:<70}", end="")
+        except:
+            pass
+
+        time.sleep(0.02)
+
+# =========================
+# MAIN
+# =========================
+print("🧪 EMG PID + BASELINE v3.0")
+print("Button: 20s baseline calib | Switch: PID motor")
+
+threading.Thread(target=uart_reader, daemon=True).start()
+threading.Thread(target=emg_pid_thread, daemon=True).start()
+
+try:
+    print("📊 0–10s: RELAX/NORMAL | 10–20s: MEDIUM+FULL (creates low baseline)")
+    button_last_state = GPIO.input(BUTTON_PIN)
+
+    while True:
+        button_state = GPIO.input(BUTTON_PIN)
+
+        # Start calibration
+        if button_last_state == 1 and button_state == 0:
+            if not calibrating and not calib_complete:
+                calibrating = True
+                calib_complete = False
+                calibration_start_time = time.time()
+                emg_data.clear()
+                no_flex_start = calibration_start_time
+                play_calib_sequence()
+                print("\n🚀 *** 20s BASELINE CALIBRATION ***")
+                print(" ➤ 0–10s: RELAX (true minimum)")
+                print(" ➤ 10–20s: MEDIUM → FULL (strong effort)")
+            elif calib_complete:
+                print("\n🔄 Baseline + PID set. Button for melody.")
+                play_melody()
+
+        button_last_state = button_state
+
+        # Calibration progress
+        if calibrating:
+            elapsed = time.time() - calibration_start_time
+            if elapsed < 10:
+                phase_msg = "RELAX (BASELINE)"
+                color = "🟢"
+            else:
+                phase_msg = "MEDIUM+FULL"
+                color = "🔴"
+            print(f"\r⏱ {elapsed:4.1f}s | {color} {phase_msg:<15}", end="")
+
+            if elapsed >= 20.0:
+                calibrating = False
+                play_calib_sequence()
+                print("\n✅ Creating baseline + PID thresholds...")
+                process_calibration()
+
+        time.sleep(0.02)
+
+except KeyboardInterrupt:
+    print("\nShutting down...")
+
+finally:
+    running = False
+    time.sleep(0.2)
+    servo_pwm.stop()
+    buzzer_pwm.stop()
+    GPIO.cleanup()
+    ser.close()
+    print("✅ EMG PID + BASELINE v3.0 - Done!")

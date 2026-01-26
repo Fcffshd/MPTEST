@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+import os
+import sys
+import subprocess
+
+# --- AUTO-TERMINAL START ---
+# This forces the script to open a new terminal window if you double-click it
+if not os.isatty(sys.stdin.fileno()):
+    subprocess.run(['lxterminal', '-e', 'python3', os.path.abspath(__file__)])
+    sys.exit()
+# --- AUTO-TERMINAL END ---
+
+# ... PASTE YOUR ACTUAL SERVO CODE BELOW THIS LINE ...
+import time
+# etc...

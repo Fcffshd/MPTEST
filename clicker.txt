@@ -1,0 +1,82 @@
+import time
+import serial
+import sys
+import os
+
+# =========================
+# SETTINGS
+# =========================
+CLICK_THRESHOLD = 2.3    # Trigger click above 2.3V
+RELEASE_THRESHOLD = 2.2  # Release click below 2.2V
+SERIAL_PORT = 'devttyAMA0'
+BAUD_RATE = 115200
+
+# =========================
+# INITIALIZATION
+# =========================
+print(🖱️  Initializing Manual Mouse Clicker...)
+
+# 1. Check if the USB Mouse Device exists
+if not os.path.exists('devhidg0')
+    print(❌ ERROR USB Gadget not active.)
+    print(   Run this command first sudo usrbinusb_hid.sh)
+    sys.exit(1)
+
+# 2. Open the Mouse Device
+try
+    mouse_dev = open('devhidg0', 'wb', buffering=0)
+except PermissionError
+    print(❌ ERROR Permission denied. Run with 'sudo'.)
+    sys.exit(1)
+
+# 3. Open the Serial Port (EMG Sensor)
+try
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.01)
+except Exception as e
+    print(f❌ SERIAL ERROR {e})
+    print(   (Note If another script is controlling the servo using this port,)
+    print(    this script will fail or crash the other one.))
+    sys.exit(1)
+
+print(f✅ Ready! Left clicking at {CLICK_THRESHOLD}V...)
+
+# =========================
+# MAIN LOOP
+# =========================
+clicking = False
+smoothed_v = 1.5
+alpha = 0.2  # Smoothing factor (0.0 - 1.0)
+
+try
+    while True
+        if ser.in_waiting
+            try
+                line = ser.readline().decode('utf-8', errors='ignore').strip()
+                if line.startswith(EMG)
+                    # Parse Voltage
+                    raw_v = float(line.split()[1].split(V)[0])
+                    
+                    # Smooth Data (removes noise spikes)
+                    smoothed_v = (alpha  raw_v) + ((1 - alpha)  smoothed_v)
+                    
+                    # LOGIC Click vs Release
+                    if smoothed_v  CLICK_THRESHOLD and not clicking
+                        mouse_dev.write(b'x01x00x00x00') # LEFT CLICK DOWN
+                        clicking = True
+                        print(f🔻 CLICK  ({smoothed_v.2f}V))
+                        
+                    elif smoothed_v  RELEASE_THRESHOLD and clicking
+                        mouse_dev.write(b'x00x00x00x00') # RELEASE
+                        clicking = False
+                        print(f🔺 RELEASE ({smoothed_v.2f}V))
+                        
+            except ValueError
+                pass 
+                
+        time.sleep(0.002)
+
+except KeyboardInterrupt
+    print(nSTOPPING...)
+    mouse_dev.write(b'x00x00x00x00') # Force release buttons
+    mouse_dev.close()
+    ser.close()
